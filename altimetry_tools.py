@@ -6,15 +6,18 @@ from scipy.fftpack import fft
 from tqdm.notebook import tqdm
 from math import radians, degrees, sin, cos, asin, acos, sqrt
 
-# This library includes 
+# ***This library includes*** 
 # - Haversine              (great circle distance between points)
 # - nan_helper             (ID nan indices in 1d array)
 # - interp_nans            (interpolate nans ID'd in nan_helper with cutoff criteria)
 # - parse_grid_tracks      *(takes dataset and parses measurements into 2d arrays for each track [cycle X distance])* 
-# - specsharp              (create sharp filter kernel)
-# - smooth_tracks          (master smoothing function, calls specsharp)
+# - filterSpec             generalized laplacian/biharmonic filter (Taper or Gaussian)
+# - Laplacian1D            computes laplacian for fixed grid step 
+# - velocity               (cross-track geostrophic vel) (*note: ignores, does not flip sign in n. vs. s. hemisphere)
+# *** Secondardy (older/unused) Functions ***
+# - specsharp              create sharp filter kernel, outputs actual filter weights
+# - smooth_tracks          master smoothing function, calls specsharp
 # - coarsen                (take smoothed signal and coarsen to filter scale)
-# - velocity               (cross-track geostrophic velocity) (*note: doesn't get sign correct, nor address flip in sign in n. vs. s. hemisphere)
 # - spectra_slopes         (estimate wavenumber spectra and linear slope over defined mesoscale wavenumber band)
 
 # --- output in kilometers --- 
@@ -256,6 +259,130 @@ def parse_grid_tracks(tracks, df2_s, d_grid_step, interp_cutoff, f_v_uf):
         count = count + 1
 
     return lon_t, lat_t, track_t, adt, sla_int, dist, lon_record, lat_record, time_record, track_record
+
+
+# -----------------------------------------------------------------------------------------
+# Generalized Sharp Filter, needs 1d Laplacian to implement 
+def filterSpec(N, dxMin, Lf, show_p, shape, X=np.pi):
+    """
+    Inputs: 
+    N is the number of total steps in the filter
+    dxMin is the smallest grid spacing - should have same units as Lf
+    Lf is the filter scale, which has different meaning depending on filter shape
+    shape can currently be one of two things:
+        Gaussian: The target filter has kernel ~ e^{-|x/Lf|^2}
+        Taper: The target filter has target grid scale Lf. Smaller scales are zeroed out. 
+               Scales larger than pi*Lf/2 are left as-is. In between is a smooth transition.
+    Note that the above are properties of the *target* filter, which are not the same as the actual filter.
+    
+    Outputs:
+    NL is the number of Laplacian steps
+    sL is s_i for the Laplacian steps; units of sL are one over the units of dxMin and Lf, squared
+    NB is the number of Biharmonic steps
+    sB is s_i for the Biharmonic steps; units of sB are one over the units of dxMin and Lf, squared
+    """
+    # Code only works for N>2
+    if N <= 2:
+        print("Code requires N>2")
+        return 
+    # First set up the mass matrix for the Galerkin basis from Shen (SISC95)
+    M = (np.pi/2)*(2*np.eye(N-1) - np.diag(np.ones(N-3),2) - np.diag(np.ones(N-3),-2))
+    M[0,0] = 3*np.pi/2
+    # The range of wavenumbers is 0<=|k|<=sqrt(2)*pi/dxMin. Nyquist here is for a 2D grid. 
+    # Per the notes, define s=k^2.
+    # Need to rescale to t in [-1,1]: t = (2/sMax)*s -1; s = sMax*(t+1)/2
+    sMax = 2*(np.pi/dxMin)**2
+    # Set up target filter
+    if shape == "Gaussian":
+        F = lambda t: np.exp(-(sMax*(t+1)/2)*(Lf/2)**2)
+    elif shape == "Taper":
+        # F = interpolate.PchipInterpolator(np.array([-1,(2/sMax)*(2/Lf)**2 -1,(2/sMax)*(np.pi/Lf)**2 -1,2]),np.array([1,1,0,0]))
+        F = interpolate.PchipInterpolator(np.array([-1,(2/sMax)*(np.pi/(X*Lf))**2 -1,(2/sMax)*(np.pi/Lf)**2 -1,2]),np.array([1,1,0,0]))
+        # 2nd entry = (2/sMax)*(np.pi/(X*Lf))**2 -1  X = width of transition (~np.pi)
+        # 3rd entry = nyquist wavelength on grid I'm filtering to
+    else:
+        print("Please input a valid shape")
+        return
+    # Compute inner products of Galerkin basis with target
+    b = np.zeros(N-1)
+    points, weights = np.polynomial.chebyshev.chebgauss(N+1)
+    for i in range(N-1):
+        tmp = np.zeros(N+1)
+        tmp[i] = 1
+        tmp[i+2] = -1
+        phi = np.polynomial.chebyshev.chebval(points,tmp)
+        b[i] = np.sum(weights*phi*(F(points)-((1-points)/2 + F(1)*(points+1)/2)))
+    # Get polynomial coefficients in Galerkin basis
+    cHat = np.linalg.solve(M,b)
+    # Convert back to Chebyshev basis coefficients
+    p = np.zeros(N+1)
+    p[0] = cHat[0] + (1+F(1))/2
+    p[1] = cHat[1] - (1-F(1))/2
+    for i in range(2,N-1):
+        p[i] = cHat[i] - cHat[i-2]
+    p[N-1] = -cHat[N-3]
+    p[N] = -cHat[N-2]
+    # Now plot the target filter and the approximate filter
+    x = np.linspace(-1,1,251)
+    k = np.sqrt((sMax/2)*(x+1))
+    
+    if show_p > 0:
+        f, (ax1, ax2) = plt.subplots(1,2,figsize=(14, 2))
+        ax1.plot(k,F(x),k,np.polynomial.chebyshev.chebval(x,p))
+        ax2.plot(k,F(x)-np.polynomial.chebyshev.chebval(x,p))
+        ax1.set_title('approx. filter')
+        ax1.set_xlabel('step')
+        ax2.set_title('target - approx. error')
+        ax2.set_xlabel('step')
+        ax2.set_ylim([-0.25, 0.25])
+        plt.show()
+        
+    # Get roots of the polynomial
+    r = np.polynomial.chebyshev.chebroots(p)
+    # convert back to s in [0,sMax]
+    s = (sMax/2)*(r+1)
+    # Separate out the real and complex roots
+    NL = np.size(s[np.where(np.abs(np.imag(r)) < 1E-12)]) 
+    sL = np.real(s[np.where(np.abs(np.imag(r)) < 1E-12)])
+    NB = (N - NL)//2
+    sB_re,indices = np.unique(np.real(s[np.where(np.abs(np.imag(r)) > 1E-12)]),return_index=True)
+    sB_im = np.imag(s[np.where(np.abs(np.imag(r)) > 1E-12)])[indices]
+    sB = sB_re + sB_im*1j
+    return NL,sL,NB,sB
+
+
+# -----------------------------------------------------------------------------------------
+def Laplacian1D(field,landMask,dx):
+    """
+    Computes a Cartesian Laplacian of field. Assumes dy=constant, dx varies in y direction
+    Inputs:
+    field is a 1D array (x) whose Laplacian is computed
+    landMask: 1D array, same size as field: 0 if cell is not on land, 1 if it is on land.
+    dx is a 1D array, size size as 2nd dimension of field
+    Output:
+    Laplacian of field.
+    """
+    Nx = np.size(field,0)
+    # Ny = np.size(field,1) # I suppose these could be inputs
+    notLand = 1 - landMask
+    # first compute Laplacian in y direction. "Right" is north and "Left" is south for this block
+    fluxRight = np.zeros(Nx)
+    fluxRight[0:Nx-1] = notLand[1:Nx]*(field[1:Nx] - field[0:Nx-1]) # Set flux to zero if on land
+    # fluxRight[:,Ny-1] = notLand[:,0]*(field[:,0]-field[:,Ny-1]) # Periodic unless there's land in the way
+    
+    fluxLeft = np.zeros(Nx)
+    fluxLeft[1:Nx] = notLand[0:Nx-1]*(field[1:Nx] - field[0:Nx-1]) # Set flux to zero if on land
+    # fluxLeft[:,0] = notLand[:,Ny-1]*(field[:,0]-field[:,Ny-1]) # Periodic unless there's land in the way
+    OUT = (1/(dx**2))*(fluxRight - fluxLeft)
+    # Now compute Laplacian in x direction and add it back in
+    # fluxRight = 0*fluxRight # re-set to zero just to be safe
+    # fluxLeft = 0*fluxLeft # re-set to zero just to be safe
+    # fluxRight[0:Nx-1,:] = notLand[1:Nx,:]*(field[1:Nx,:] - field[0:Nx-1,:]) # Set flux to zero if on land
+    # fluxRight[Nx-1,:] = notLand[0,:]*(field[0,:]-field[Nx-1,:]) # Periodic unless there's land in the way
+    # fluxLeft[1:Nx,:] = notLand[0:Nx-1,:]*(field[1:Nx,:] - field[0:Nx-1,:]) # Set flux to zero if on land
+    # fluxLeft[0,:] = notLand[Nx-1,:]*(field[0,:]-field[Nx-1,:]) # Periodic unless there's land in the way
+    # OUT = OUT + (1/(dx**2))*(fluxRight - fluxLeft)
+    return OUT*notLand
 
 
 # -----------------------------------------------------------------------------------------
