@@ -5,6 +5,7 @@ import numpy as np
 from scipy.fftpack import fft
 from tqdm.notebook import tqdm
 from math import radians, degrees, sin, cos, asin, acos, sqrt
+import matplotlib.pyplot as plt
 
 # ***This library includes*** 
 # - Haversine              (great circle distance between points)
@@ -13,6 +14,7 @@ from math import radians, degrees, sin, cos, asin, acos, sqrt
 # - parse_grid_tracks      *(takes dataset and parses measurements into 2d arrays for each track [cycle X distance])* 
 # - filterSpec             generalized laplacian/biharmonic filter (Taper or Gaussian)
 # - Laplacian1D            computes laplacian for fixed grid step 
+# - Filter                 calls filterSpec and Laplacian1D to generate filter applies to desired field 
 # - velocity               (cross-track geostrophic vel) (*note: ignores, does not flip sign in n. vs. s. hemisphere)
 # *** Secondardy (older/unused) Functions ***
 # - specsharp              create sharp filter kernel, outputs actual filter weights
@@ -384,6 +386,32 @@ def Laplacian1D(field,landMask,dx):
     # OUT = OUT + (1/(dx**2))*(fluxRight - fluxLeft)
     return OUT*notLand
 
+# -----------------------------------------------------------------------------------------
+# FILTER DATA with filterSpec and Laplacian1D
+def Filter(N, filter_type, plot_filter, field, dx, coarsening_factor):
+    NL,sL,NB,sB = filterSpec(N, dx, coarsening_factor*dx, plot_filter, filter_type, X=np.pi)
+    sla_filt_out = []
+    # each track
+    for c in tqdm(range(len(field))):
+        sla_filt = np.nan * np.ones(np.shape(field[c]))
+        land = np.where(np.isnan(field[c][1, :]))[0]
+        landMask = np.zeros(np.shape(field[c])[1])
+        landMask[land] = 1
+        # each cycle
+        for m in range(np.shape(field[c])[0]):
+            data = field[c][m, :].copy()
+            # tempL_out = np.nan * np.ones((NL, np.shape(field)[0], np.shape(field)[1]))
+            for i in range(NL):
+                tempL = Laplacian1D(data,landMask,dx)
+                # tempL_out[i, :, :] = tempL.copy()
+                data = data + (1/sL[i])*tempL # Update filtered field
+            for i in range(NB):
+                tempL = Laplacian1D(data, landMask, dx)
+                tempB = Laplacian1D(tempL, landMask, dx)
+                data = data + (2*np.real(sB[i])/(np.abs(sB[i])**2))*tempL + (1/(np.abs(sB[i])**2))*tempB
+            sla_filt[m, :] = data
+        sla_filt_out.append(sla_filt)
+    return(sla_filt_out)
 
 # -----------------------------------------------------------------------------------------
 # create filter kernel, function of
