@@ -15,7 +15,11 @@ import matplotlib.pyplot as plt
 # - filterSpec             generalized laplacian/biharmonic filter (Taper or Gaussian)
 # - Laplacian1D            computes laplacian for fixed grid step 
 # - Filter                 calls filterSpec and Laplacian1D to generate filter applies to desired field 
-# - velocity               (cross-track geostrophic vel) (*note: ignores, does not flip sign in n. vs. s. hemisphere)
+# - smooth_tracks_deg      filters to local delta longitude (in units of degree, i.e. 1/4)
+# - smooth_tracks_Ld       filters to local deformation radius scale
+# - smooth_tracks_boxcar   boxcar filter
+# - velocity               cross-track geostrophic vel (*note: ignores and does not flip sign in n. vs. s. hemisphere)
+
 # *** Secondardy (older/unused) Functions ***
 # - specsharp              create sharp filter kernel, outputs actual filter weights
 # - smooth_tracks          master smoothing function, calls specsharp
@@ -414,6 +418,175 @@ def Filter(N, filter_type, plot_filter, field, dx, coarsening_factor):
     return(sla_filt_out)
 
 # -----------------------------------------------------------------------------------------
+# -- ALT FILTERING FUNCTION 1
+# define function to filter using a filter of variable length 
+# (filter scale = local distance equal to a desired grid step in longitude i.e. 1/4 degree)
+# filter USED is GAUSSIAN 
+def smooth_tracks_deg(dist, sla, lon_record, lat_record, resolution, sigma):
+    # resolution = desired grid scale to filter to (i.e. 1/4 degree)
+    # sigma = gaussian standard deviation 
+    sla_filtered = []
+    for m in tqdm(range(len(sla))):
+        this_sla = sla[m]
+        this_lon = lon_record[m]
+        this_lat = lat_record[m]
+        this_dist = dist[m]     
+        this_lon_step = 1852 * 60 * np.cos(np.deg2rad(this_lat)) * (resolution)
+        sla_filt = np.nan * np.ones(np.shape(this_sla))
+        for i in range(11, np.shape(this_sla)[1] - 11):  # loop across all space
+            if np.isnan(this_lon_step[i]):
+                continue
+            this_local_grid = np.arange(-this_lon_step[i]*4, this_lon_step[i]*5, this_lon_step[i])   # create local grid 
+            for k in range(np.shape(this_sla)[0]):                                                   # loop in time (across each cycle)
+                sla_on_local_lon_grid = np.interp(this_local_grid, (this_dist[i-10:i+11]*1000) - this_dist[i]*1000, this_sla[k, i-10:i+11])
+                sla_filt[k, i] = si.gaussian_filter(sla_on_local_lon_grid, sigma, order=0)[10]       # extract middle value [index=10]       
+        sla_filtered.append(sla_filt)
+    return sla_filtered
+
+# -----------------------------------------------------------------------------------------
+# -- ALT FILTERING FUNCTION 2
+# define a function to filter where local filter width is defined using the local deformation radius
+# filter used is GAUSSIAN
+def smooth_tracks_Ld(dist, sla, lon_record, lat_record, resolution, c98):
+    # resolution = horizontal grid spacing 
+    # c98 = array of deformation radii 
+    # filter scale = local deformation radius / resolution = filter width in number of grid points
+    sla_filtered = []
+    for m in tqdm(range(len(sla))):  # loop over each track
+        this_sla = sla[m]
+        this_lon = lon_record[m]
+        this_lat = lat_record[m]      
+        # at each location along track, find local deformation radius 
+        sla_filt = np.nan * np.ones(np.shape(this_sla))
+        for i in range(10, np.shape(this_sla)[1] - 11):  # loop across all space for each track
+            # print(this_lon[i])
+            if np.isnan(this_lon[i]):
+                continue
+            # find deformation radius 
+            c_in = np.where((c98[:, 0] > this_lat[i]-0.75) & (c98[:, 0] < this_lat[i]+0.75) & \
+                     (c98[:, 1] > this_lon[i]-0.75) & (c98[:, 1] < this_lon[i]+0.75))[0]
+            if len(c_in) >= 1:
+                this_Ld = np.nanmean(c98[c_in, 3])
+                for k in range(np.shape(this_sla)[0]):  # loop in time 
+                    # apply filter across a subset of points and then take middle (relevant value) [10th index]
+                    sla_filt[k, i] = si.gaussian_filter(this_sla[k, i-10:i+11], this_Ld/resolution, order=0)[10]
+        sla_filtered.append(sla_filt)
+    return sla_filtered
+
+# -----------------------------------------------------------------------------------------
+# -- ALT FILTERING FUNCTION 3
+# simplist filter using boxcar moving average 
+def smooth_tracks_boxcar(dist, sla, coarsening_factor0):
+    sla_filtered = []
+    for m in tqdm(range(len(sla))):  # loop over each track
+        this_sla = sla[m]
+        this_dist = dist[m]
+        # filter kernel values = 1/(2n+1)
+        b_filt = (1/(2*coarsening_factor0 + 1))*np.ones(2*coarsening_factor0 + 1)  
+        sla_filt = np.nan * np.ones(np.shape(this_sla))
+        for i in range(np.shape(this_sla)[0]):
+            sla_filt[i, :] = np.convolve(this_sla[i, :],b_filt,mode='same')     
+        sla_filtered.append(sla_filt)
+    return sla_filtered
+
+# -----------------------------------------------------------------------------------------
+# -- CROSS-TRACK GEOSTROPHIC VELOCITY (from sla or adt)
+# --------------------------------------------------------------------
+def velocity(dist, sla, lon_record, lat_record, track_record, stencil_width):   
+    transition_lat = 5  # latitude to smoothly transition to beta-plane from local f-plane
+    vel = []
+    vel_f = []
+    grad = []
+    count = 0
+    for m in tqdm(range(len(track_record))):
+        # -- load in data for this track 
+        this_sla = sla[m]            # interpolated field, sla is just a place holder (confusing I know)
+        lon_grid = lon_record[m]
+        lat_grid = lat_record[m]
+        d_grid = dist[m]
+        grid_space = d_grid[1] - d_grid[0]
+        these_cycles = np.arange(0, np.shape(this_sla)[0])                 
+        if len(d_grid) < 10:
+            print('track ' + str(m) + ', too short') 
+            grad.append(np.nan * np.ones(np.shape(this_sla)))
+            vel.append(np.nan * np.ones(np.shape(this_sla)))
+            continue
+            
+        # -- gradient ([Arbic 2012]) (pol_rad = 6378.137km) (eq_rad = 6356.752km) 
+        f_loc = 2*(7.27*10**(-5))*np.sin(np.deg2rad(lat_grid))    
+        sla_grad = np.gradient(this_sla, d_grid*1000.0, axis=1)
+        for cdm in range(4, 4 + len(sla_grad[0, 4:-3])):
+            # -- gradients from a 7 point stencil 
+            if stencil_width == 7:   
+                sla_grad[:, cdm] = (this_sla[:, cdm+3] - 9*this_sla[:, cdm+2] + 45*this_sla[:, cdm+1] \
+                                    - 45*this_sla[:, cdm-1] + 9*this_sla[:, cdm-2] - this_sla[:, cdm-3]) / (60*(grid_space*1000.0))   
+            # -- gradients from a 5 point stencil
+            elif stencil_width == 5:   
+                sla_grad[:, cdm] = (-this_sla[:, cdm+2] + 8*this_sla[:, cdm+1] - 8*this_sla[:, cdm-1] \
+                                    + this_sla[:, cdm-2]) / (12*(hor_grid_spacing*1000.0))
+            elif stencil_width == 3: 
+                sla_grad[:, cdm] = (this_sla[:, cdm+1] - this_sla[:, cdm-1]) / (2*(hor_grid_spacing*1000.0))  
+            else:
+                print('select either 3,5,7 for gradient stencil_width')
+                
+        # velocity via geostrophic balance 
+        this_vel = (9.81/np.tile(f_loc[None, :], (len(these_cycles), 1))) * sla_grad 
+        this_vel_f = this_vel.copy()
+        
+        # -- near equator attempt beta plane correction from [Lagerloef 1999] 
+        close_eq1 = np.where(np.abs(lat_grid) < transition_lat)[0]
+        if len(close_eq1) > 10:  # if there are points close to equator, make sure there are enough to compute a gradient
+            beta = 2*(7.27*10**(-5))*np.cos(np.deg2rad(lat_grid[close_eq1]))/(6356752)
+            y = 1852 * 60 * (lat_grid[close_eq1] - 0)  # 6356752*lat_grid[close_eq1]  
+            # -- weights transitioning from beta plane to f plane 
+            wb = np.exp(-(np.abs(lat_grid[close_eq1])/2.2)**2)
+            wf = 1 - wb           
+            # L = 111000, theta = y/L
+            
+            # -- geostrophic balance 
+            uf = (9.81/(np.tile(f_loc[close_eq1][None, :], (len(these_cycles), 1)))) * sla_grad[:, close_eq1]  
+            # -- approximate the along-track distance of d_eta/dx
+            # d_sla_grad_dx = np.zeros(np.shape(sla_grad[:, close_eq1]))
+            # d_sla_grad_dx[:, 1:-1] = (sla_grad[:, close_eq1[2:]] - sla_grad[:, close_eq1[0:-2]])/(y[2:] - y[0:-2])
+            # ub = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1)))) * d_sla_grad_dx            
+            ub = (9.81/(y*np.tile(beta[None, :], (len(these_cycles), 1)))) * sla_grad[:, close_eq1]
+            # ub = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1)))) * np.gradient(sla_grad[:, close_eq1], y, axis=1)  # improper gradient estimate
+            # -- attempt at asympototic solution
+            # ub1 = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1))*y)) * adt_grad[:, close_eq1] # * np.tile(theta[None, :], (len(these_cycles), 1))
+            # ub2 = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1))*L)) * \
+            #     adt_grad[:, close_eq1] * np.tile(theta[None, :]**2, (len(these_cycles), 1))
+            # ub3 = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1))*L)) * \
+            #     adt_grad[:, close_eq1] * np.tile(theta[None, :]**3, (len(these_cycles), 1))
+            # ub = ub1  # ub1 + ub2 + ub3
+            
+            # -- combine uf, wb each scaled by weights 
+            ug = np.tile(wb[None, :], (len(these_cycles), 1))*ub + np.tile(wf[None, :], (len(these_cycles), 1))*uf
+            this_vel[:, close_eq1] = ug 
+            
+            # -- debugging / inspecting actual values 
+            if m == 23:
+                print(beta)
+                print(lat_grid[close_eq1])
+                # print(d_sla_grad_dx[5, :])
+                print(ub[5, :])
+                print(ug[5, :] - uf[5, :])
+                print(ug[5, :])
+        
+        # -- save for each track arrays of fields [cycle X Distance] (each array is an element in a list)
+        grad.append(sla_grad)
+        vel.append(this_vel)
+        vel_f.append(this_vel_f)
+               
+    return grad, vel, vel_f
+
+
+# -----------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
+# SECONDARY FUNCTIONS 
+# -----------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # create filter kernel, function of
 # - grid step (grid_spacing) (I'm using units of km) 
 # - coarsening factor (x) (grid_spacing * coarse_fac = desired grid step) 
@@ -553,102 +726,6 @@ def coarsen(dist, lon_record, lat_record, coarsening_factor, sig_in):
         coarse_sig_out.append(coarse_i)
                     
     return coarse_grid_out, coarse_lon_out, coarse_lat_out, coarse_sig_out
-
-# -----------------------------------------------------------------------------------------
-# -- cross track velocity --
-def velocity(adt, sla, adt_smooth, sla_smooth, lon_record, lat_record, time_record, track_record):
-    vel = []
-    vel_tot = []
-    vel_tot_smooth = []
-    tot_grad = []
-    count = 0
-    for m in tqdm(range(len(track_record))):
-        # -- load in data for this track 
-        this_adt = adt[m]  # interpolated field
-        this_sla = sla[m]  # interpolated field   
-        smoothed_adt = adt_smooth[m]  # interpolated field
-        smoothed_sla = sla_smooth[m]  # interpolated field   
-        lon_grid = lon_record[m]
-        lat_grid = lat_record[m]
-        d_grid = dist[m]
-        these_cycles = np.arange(0, np.shape(this_sla)[0])
-                  
-        if len(d_grid) < 10:
-            print('track ' + str(m) + ', too short') 
-            tot_grad.append(np.nan * np.ones(np.shape(this_sla)))
-            vel.append(np.nan * np.ones(np.shape(this_sla)))
-            vel_tot.append(np.nan * np.ones(np.shape(this_sla)))
-            vel_tot_smooth.append(np.nan * np.ones(np.shape(this_sla)))
-            continue
-            
-        # -- gradient (of interpolated field)
-        # (pol_rad = 6378.137km) (eq_rad = 6356.752km) 
-        f_loc = 2*(7.27*10**(-5))*np.sin(np.deg2rad(lat_grid))    
-        
-        # estimate gradient from Arbic 2012 
-        sla_grad = np.gradient(this_sla, d_grid*1000.0, axis=1)
-        adt_grad = np.gradient(this_adt, d_grid*1000.0, axis=1)
-        adt_smooth_grad = np.gradient(smoothed_adt, d_grid*1000.0, axis=1)
-        for cdm in range(4, 4 + len(sla_grad[0, 4:-3])):
-            # -- gradients from a 7 point stencil 
-            sla_grad[:, cdm] = (this_sla[:, cdm+3] - 9*this_sla[:, cdm+2] + 45*this_sla[:, cdm+1] \
-                                - 45*this_sla[:, cdm-1] + 9*this_sla[:, cdm-2] - this_sla[:, cdm-3]) / (60*(hor_grid_spacing*1000.0))
-            adt_grad[:, cdm] = (this_adt[:, cdm+3] - 9*this_adt[:, cdm+2] + 45*this_adt[:, cdm+1] \
-                                - 45*this_adt[:, cdm-1] + 9*this_adt[:, cdm-2] - this_adt[:, cdm-3]) / (60*(hor_grid_spacing*1000.0))
-            # smoothed gradient 
-            adt_smooth_grad[:, cdm] = (smoothed_adt[:, cdm+3] - 9*smoothed_adt[:, cdm+2] + 45*smoothed_adt[:, cdm+1] \
-                                - 45*smoothed_adt[:, cdm-1] + 9*smoothed_adt[:, cdm-2] - smoothed_adt[:, cdm-3]) / (60*(hor_grid_spacing*1000.0))    
-            
-            # -- gradients from a 5 point stencil 
-            # adt_grad[:, cdm] = (-this_adt[:, cdm+2] + 8*this_adt[:, cdm+1] - 8*this_adt[:, cdm-1] + this_adt[:, cdm-2]) / (12*(hor_grid_spacing*1000.0))
-            # adt_smooth_grad[:, cdm] = (-smoothed_adt_gauss[:, cdm+2] + 8*smoothed_adt_gauss[:, cdm+1] \
-            #        - 8*smoothed_adt_gauss[:, cdm-1] + smoothed_adt_gauss[:, cdm-2]) / (12*(hor_grid_spacing*1000.0))
-
-        # compute velocity via geostrophic balance 
-        this_vel = (9.81/np.tile(f_loc[None, :], (len(these_cycles), 1))) * sla_grad  # np.gradient(this_interp_sla, d_grid*1000.0, axis=1)
-        this_vel_tot = (9.81/np.tile(f_loc[None, :], (len(these_cycles), 1))) * adt_grad  # np.gradient(this_adt, d_grid*1000.0, axis=1)
-        this_vel_tot_s = (9.81/f_loc) * adt_smooth_grad  # np.gradient(smoothed_adt_gauss, d_grid*1000.0, axis=1)
-        
-        # near equator attempt beta plane correction from Lagerloef 1999 
-        close_eq1 = np.where(np.abs(lat_grid) < 2.5)[0]
-        if len(close_eq1) > 4:  # if there are points close to equator, make sure there are enough to compute a gradient
-            beta = 2*(7.27*10**(-5))*np.cos(np.deg2rad(lat_grid[close_eq1]))/(6356752)
-            y = 1852 * 60 * (lat_grid[close_eq1] - 0)  # 6356752*lat_grid[close_eq1]  
-            # weights transitioning from beta plane to f plane 
-            wb = np.exp(-(np.abs(lat_grid[close_eq1])/2.2)**2)
-            wf = 1 - wb           
-            L = 111000
-            theta = y/L
-            
-            # uf = (9.81/np.tile(f_loc[close_eq1][None, :], (len(these_cycles), 1))) * adt_grad[:, close_eq1]
-            ub = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1)))) * np.gradient(adt_grad[:, close_eq1], y, axis=1)
-            uf_smooth = (9.81/np.tile(f_loc[close_eq1][None, :], (len(these_cycles), 1))) * adt_smooth_grad[:, close_eq1]
-            ub_smooth = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1)))) * np.gradient(adt_smooth_grad[:, close_eq1], y, axis=1)
-            
-            uf = (9.81/(np.tile(f_loc[close_eq1][None, :], (len(these_cycles), 1)))) * adt_grad[:, close_eq1]   # np.tile(1/theta[None, :], (len(these_cycles), 1))
-            # ub1 = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1))*y)) * adt_grad[:, close_eq1] # * np.tile(theta[None, :], (len(these_cycles), 1))
-            # ub2 = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1))*L)) * \
-            #     adt_grad[:, close_eq1] * np.tile(theta[None, :]**2, (len(these_cycles), 1))
-            # ub3 = (9.81/(np.tile(beta[None, :], (len(these_cycles), 1))*L)) * \
-            #     adt_grad[:, close_eq1] * np.tile(theta[None, :]**3, (len(these_cycles), 1))
-            # ub = ub1  # ub1 + ub2 + ub3
-            ug = np.tile(wb[None, :], (len(these_cycles), 1))*ub + np.tile(wf[None, :], (len(these_cycles), 1))*uf
-            this_vel_tot[:, close_eq1] = ug 
-            # print(lat_grid[close_eq1])
-            # print(y)
-            # print(uf_smooth[0, :])
-            # print(ub_smooth[0, :])
-            ug_smooth = np.tile(wb[None, :], (len(these_cycles), 1))*ub_smooth + np.tile(wf[None, :], (len(these_cycles), 1))*uf_smooth
-            this_vel_tot_s[:, close_eq1] = ug_smooth
-        
-        # -- save for each track arrays of fields [cycle X Distance] (each array is an element in a list)
-        tot_grad.append(adt_grad)
-        vel.append(this_vel)
-        vel_tot.append(this_vel_tot)
-        vel_tot_smooth.append(this_vel_tot_s)
-               
-    return tot_grad, vel, vel_tot, vel_tot_smooth
-
 
 # -----------------------------------------------------------------------------------------
 # -- horizontal wavenumber spectra --
