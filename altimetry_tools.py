@@ -14,10 +14,9 @@ import matplotlib.pyplot as plt
 # - parse_grid_tracks      *(takes dataset and parses measurements into 2d arrays for each track [cycle X distance])* 
 # - filterSpec             generalized laplacian/biharmonic filter (Taper or Gaussian)
 # - Laplacian1D            computes laplacian for fixed grid step 
-# - Filter                 calls filterSpec and Laplacian1D to generate filter applies to desired field 
+# - Filter                 calls filterSpec and Laplacian1D to generate/apply desried filter  (sharp, gaussian, boxcar)
 # - smooth_tracks_deg      filters to local delta longitude (in units of degree, i.e. 1/4)
 # - smooth_tracks_Ld       filters to local deformation radius scale
-# - smooth_tracks_boxcar   boxcar filter
 # - velocity               cross-track geostrophic vel (*note: ignores and does not flip sign in n. vs. s. hemisphere)
 
 # *** Secondardy (older/unused) Functions ***
@@ -392,29 +391,42 @@ def Laplacian1D(field,landMask,dx):
 
 # -----------------------------------------------------------------------------------------
 # FILTER DATA with filterSpec and Laplacian1D
-def Filter(N, filter_type, plot_filter, field, dx, coarsening_factor):
-    NL,sL,NB,sB = filterSpec(N, dx, coarsening_factor*dx, plot_filter, filter_type, X=np.pi)
-    sla_filt_out = []
-    # each track
-    for c in tqdm(range(len(field))):
-        sla_filt = np.nan * np.ones(np.shape(field[c]))
-        land = np.where(np.isnan(field[c][1, :]))[0]
-        landMask = np.zeros(np.shape(field[c])[1])
-        landMask[land] = 1
-        # each cycle
-        for m in range(np.shape(field[c])[0]):
-            data = field[c][m, :].copy()
-            # tempL_out = np.nan * np.ones((NL, np.shape(field)[0], np.shape(field)[1]))
-            for i in range(NL):
-                tempL = Laplacian1D(data,landMask,dx)
-                # tempL_out[i, :, :] = tempL.copy()
-                data = data + (1/sL[i])*tempL # Update filtered field
-            for i in range(NB):
-                tempL = Laplacian1D(data, landMask, dx)
-                tempB = Laplacian1D(tempL, landMask, dx)
-                data = data + (2*np.real(sB[i])/(np.abs(sB[i])**2))*tempL + (1/(np.abs(sB[i])**2))*tempB
-            sla_filt[m, :] = data
-        sla_filt_out.append(sla_filt)
+def Filter(N, filter_type, field, dx, coarsening_factor, *args, **kwargs):
+    
+    if filter_type == 'boxcar':
+        sla_filt_out = []
+        for m in tqdm(range(len(field))):  # loop over each track
+            this_sla = field[m]
+            b_filt = (1/(coarsening_factor))*np.ones(coarsening_factor)
+            sla_filt = np.nan * np.ones(np.shape(this_sla))
+            for i in range(np.shape(this_sla)[0]):
+                sla_filt[i, :] = np.convolve(this_sla[i, :], b_filt, mode='same')     
+            sla_filt_out.append(sla_filt)    
+    else:
+        plot_filter = kwargs.get('plot_filter', 0)
+        NL,sL,NB,sB = filterSpec(N, dx, coarsening_factor, plot_filter, filter_type, X=np.pi)
+        sla_filt_out = []
+        # each track
+        for c in tqdm(range(len(field))):
+            sla_filt = np.nan * np.ones(np.shape(field[c]))
+            land = np.where(np.isnan(field[c][1, :]))[0]
+            landMask = np.zeros(np.shape(field[c])[1])
+            landMask[land] = 1
+            # each cycle
+            for m in range(np.shape(field[c])[0]):
+                data = field[c][m, :].copy()
+                # tempL_out = np.nan * np.ones((NL, np.shape(field)[0], np.shape(field)[1]))
+                for i in range(NL):
+                    tempL = Laplacian1D(data,landMask,dx)
+                    # tempL_out[i, :, :] = tempL.copy()
+                    data = data + (1/sL[i])*tempL # Update filtered field
+                for i in range(NB):
+                    tempL = Laplacian1D(data, landMask, dx)
+                    tempB = Laplacian1D(tempL, landMask, dx)
+                    data = data + (2*np.real(sB[i])/(np.abs(sB[i])**2))*tempL + (1/(np.abs(sB[i])**2))*tempB
+                sla_filt[m, :] = data
+            sla_filt_out.append(sla_filt)
+            
     return(sla_filt_out)
 
 # -----------------------------------------------------------------------------------------
@@ -470,22 +482,6 @@ def smooth_tracks_Ld(dist, sla, lon_record, lat_record, resolution, c98):
                 for k in range(np.shape(this_sla)[0]):  # loop in time 
                     # apply filter across a subset of points and then take middle (relevant value) [10th index]
                     sla_filt[k, i] = si.gaussian_filter(this_sla[k, i-10:i+11], this_Ld/resolution, order=0)[10]
-        sla_filtered.append(sla_filt)
-    return sla_filtered
-
-# -----------------------------------------------------------------------------------------
-# -- ALT FILTERING FUNCTION 3
-# simplist filter using boxcar moving average 
-def smooth_tracks_boxcar(dist, sla, coarsening_factor0):
-    sla_filtered = []
-    for m in tqdm(range(len(sla))):  # loop over each track
-        this_sla = sla[m]
-        this_dist = dist[m]
-        # filter kernel values = 1/(2n+1)
-        b_filt = (1/(2*coarsening_factor0 + 1))*np.ones(2*coarsening_factor0 + 1)  
-        sla_filt = np.nan * np.ones(np.shape(this_sla))
-        for i in range(np.shape(this_sla)[0]):
-            sla_filt[i, :] = np.convolve(this_sla[i, :],b_filt,mode='same')     
         sla_filtered.append(sla_filt)
     return sla_filtered
 
@@ -564,13 +560,13 @@ def velocity(dist, sla, lon_record, lat_record, track_record, stencil_width):
             this_vel[:, close_eq1] = ug 
             
             # -- debugging / inspecting actual values 
-            if m == 23:
-                print(beta)
-                print(lat_grid[close_eq1])
-                # print(d_sla_grad_dx[5, :])
-                print(ub[5, :])
-                print(ug[5, :] - uf[5, :])
-                print(ug[5, :])
+            # if m == 23:
+            #     print(beta)
+            #     print(lat_grid[close_eq1])
+            #     # print(d_sla_grad_dx[5, :])
+            #     print(ub[5, :])
+            #     print(ug[5, :] - uf[5, :])
+            #     print(ug[5, :])
         
         # -- save for each track arrays of fields [cycle X Distance] (each array is an element in a list)
         grad.append(sla_grad)
