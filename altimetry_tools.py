@@ -6,6 +6,7 @@ from scipy.fftpack import fft
 from tqdm.notebook import tqdm
 from math import radians, degrees, sin, cos, asin, acos, sqrt
 import matplotlib.pyplot as plt
+import matplotlib.pylab as pylab
 
 # ***This library includes*** 
 # - Haversine              (great circle distance between points)
@@ -265,10 +266,121 @@ def parse_grid_tracks(tracks, df2_s, d_grid_step, interp_cutoff, f_v_uf):
 
     return lon_t, lat_t, track_t, adt, sla_int, dist, lon_record, lat_record, time_record, track_record
 
+# -----------------------------------------------------------------------------------------
+# NEW FILTERING METHOD
+def filterSpec(N,dxMin,Lf,plot_filter,shape="Gaussian", X=np.pi):
+    """
+    Inputs: 
+    N is the number of total steps in the filter
+    dxMin is the smallest grid spacing - should have same units as Lf
+    Lf is the filter scale, which has different meaning depending on filter shape
+    shape can currently be one of two things:
+        Gaussian: The target filter has kernel ~ e^{-|x/Lf|^2}
+        Taper: The target filter has target grid scale Lf. Smaller scales are zeroed out. 
+               Scales larger than pi*Lf/2 are left as-is. In between is a smooth transition.
+    X is the width of the transition region in the "Taper" filter; per the CPT Bar&Prime doc the default is pi.
+    Note that the above are properties of the *target* filter, which are not the same as the actual filter.
+    
+    Outputs:
+    NL is the number of Laplacian steps
+    sL is s_i for the Laplacian steps; units of sL are one over the units of dxMin and Lf, squared
+    NB is the number of Biharmonic steps
+    sB is s_i for the Biharmonic steps; units of sB are one over the units of dxMin and Lf, squared
+    """
+    # Code only works for N>2
+    if N <= 2:
+        print("Code requires N>2")
+        return 
+    # First set up the mass matrix for the Galerkin basis from Shen (SISC95)
+    M = (np.pi/2)*(2*np.eye(N-1) - np.diag(np.ones(N-3),2) - np.diag(np.ones(N-3),-2))
+    M[0,0] = 3*np.pi/2
+    # The range of wavenumbers is 0<=|k|<=sqrt(2)*pi/dxMin. Nyquist here is for a 2D grid. 
+    # Per the notes, define s=k^2.
+    # Need to rescale to t in [-1,1]: t = (2/sMax)*s -1; s = sMax*(t+1)/2
+    # sMax = 2*(np.pi/dxMin)**2
+    sMax = 1*(np.pi/dxMin)**2
+    # Set up target filter
+    if shape == "Gaussian":
+        F = lambda t: np.exp(-(sMax*(t+1)/2)*(Lf/2)**2)
+    elif shape == "Taper":
+        F = interpolate.PchipInterpolator(np.array([-1,(2/sMax)*(np.pi/(X*Lf))**2 -1,(2/sMax)*(np.pi/Lf)**2 -1,2]),np.array([1,1,0,0]))
+    else:
+        print("Please input a valid shape")
+        return
+    # Compute inner products of Galerkin basis with target
+    b = np.zeros(N-1)
+    points, weights = np.polynomial.chebyshev.chebgauss(N+1)
+    for i in range(N-1):
+        tmp = np.zeros(N+1)
+        tmp[i] = 1
+        tmp[i+2] = -1
+        phi = np.polynomial.chebyshev.chebval(points,tmp)
+        b[i] = np.sum(weights*phi*(F(points)-((1-points)/2 + F(1)*(points+1)/2)))
+    # Get polynomial coefficients in Galerkin basis
+    cHat = np.linalg.solve(M,b)
+    # Convert back to Chebyshev basis coefficients
+    p = np.zeros(N+1)
+    p[0] = cHat[0] + (1+F(1))/2
+    p[1] = cHat[1] - (1-F(1))/2
+    for i in range(2,N-1):
+        p[i] = cHat[i] - cHat[i-2]
+    p[N-1] = -cHat[N-3]
+    p[N] = -cHat[N-2]
+    # Now plot the target filter and the approximate filter
+    #x = np.linspace(-1,1,251)
+    x = np.linspace(-1,1,10000)
+    k = np.sqrt((sMax/2)*(x+1))
+    
+    # --- 
+    if plot_filter:
+        #fig, (ax1, ax2) = plt.subplots(1,2,figsize=(15,5))
+        f, ax = plt.subplots()
+        #ax1 = plt.subplot(1,2,1)
+        params = {'legend.fontsize': 'x-large',
+             'axes.labelsize': 'x-large',
+             'axes.titlesize':'x-large',
+             'xtick.labelsize':'x-large',
+             'ytick.labelsize':'x-large'}
+        pylab.rcParams.update(params)
+        plt.plot(k,F(x),'g',label='target filter',linewidth=4)
+        plt.plot(k,np.polynomial.chebyshev.chebval(x,p),'m',label='approximation',linewidth=4)
+        #plt.xticks(np.arange(5), ('0', r'$1/\Delta x$', r'$2/\Delta x$',r'$3/\Delta x$', r'$4/\Delta x$'))
+        plt.axvline(1/Lf,color='k',linewidth=2)
+        plt.axvline(np.pi/Lf,color='k',linewidth=2)
+        #plt.text(1/Lf, 1.15, r'$\frac{1}{2}$',fontsize=20)
+        #plt.text(np.pi/Lf, 1.15, r'$\frac{\pi}{2}$',fontsize=20)
+        left, right = plt.xlim()
+        plt.xlim(left=0)
+        plt.xlim(right=2)
+        bottom,top = plt.ylim()
+        plt.ylim(bottom=-0.1)
+        plt.ylim(top=1.1)
+        plt.xlabel('k', fontsize=18)
+        plt.grid(True)
+        plt.legend()
+        #plt.legend([p1, p2], ['Line Up', 'Line Down'])
+        #ax2 = plt.subplot(1,2,2)
+        #ax2.plot(k,F(x)-np.polynomial.chebyshev.chebval(x,p),linewidth=3)
+        # plt.savefig('figures/filtershape_%s%i_dxMin%i_Lf%i.png' % (shape,N,dxMin,Lf),dpi=400,bbox_inches='tight',pad_inches=0)
+    # -------
+    
+    # Get roots of the polynomial
+    r = np.polynomial.chebyshev.chebroots(p)
+    # convert back to s in [0,sMax]
+    s = (sMax/2)*(r+1)
+    # Separate out the real and complex roots
+    NL = np.size(s[np.where(np.abs(np.imag(r)) < 1E-12)]) 
+    sL = np.real(s[np.where(np.abs(np.imag(r)) < 1E-12)])
+    NB = (N - NL)//2
+    sB_re,indices = np.unique(np.real(s[np.where(np.abs(np.imag(r)) > 1E-12)]),return_index=True)
+    sB_im = np.imag(s[np.where(np.abs(np.imag(r)) > 1E-12)])[indices]
+    sB = sB_re + sB_im*1j
+    return NL,sL,NB,sB
+
 
 # -----------------------------------------------------------------------------------------
-# Generalized Sharp Filter, needs 1d Laplacian to implement 
-def filterSpec(N, dxMin, Lf, show_p, shape, X=np.pi):
+# older as of jan 2021, use filterSpec() above 
+def filterSpec0(N, dxMin, Lf, show_p, shape, X=np.pi):
     """
     Inputs: 
     N is the number of total steps in the filter
@@ -357,6 +469,126 @@ def filterSpec(N, dxMin, Lf, show_p, shape, X=np.pi):
 
 
 # -----------------------------------------------------------------------------------------
+# newer variant (test out and probably replace filterSpec 
+def filterSpec1(dxMin,Lf,d=2,shape="Gaussian",X=np.pi,N=-1,plot_filter=1):
+    """
+    Inputs: 
+    dxMin is the smallest grid spacing - should have same units as Lf
+    Lf is the filter scale, which has different meaning depending on filter shape
+    d is the dimension of the grid where the filter will be applied 
+    shape can currently be one of two things:
+        Gaussian: The target filter has kernel ~ e^{-6*|x/Lf|^2}
+        Taper: k>=2*pi/Lf are zeroed out, k<=2*pi/(X*Lf) are left as-is, smooth transition in between.
+        The std dev of the Gaussian is Lf/sqrt{12}.
+    X is the width of the transition region in the "Taper" filter; per the CPT Bar&Prime doc the default is pi.
+    Note that the above are properties of the *target* filter, which are not the same as the actual filter.
+    
+    Outputs:
+    NL is the number of Laplacian steps
+    sL is s_i for the Laplacian steps; units of sL are one over the units of dxMin and Lf, squared
+    NB is the number of Biharmonic steps
+    sB is s_i for the Biharmonic steps; units of sB are one over the units of dxMin and Lf, squared
+    """
+    if N == -1:
+        if shape == "Gaussian":
+            if d == 1:
+                N = np.ceil(1.3*Lf/dxMin).astype(int)
+            else: # d==2
+                N = np.ceil(1.8*Lf/dxMin).astype(int)
+        else: # Taper
+            if d == 1:
+                # N = np.ceil(4.5*Lf/dxMin).astype(int)  # what ian selected 
+                N = np.ceil(4.5*Lf/dxMin).astype(int)
+            else: # d==2
+                N = np.ceil(6.4*Lf/dxMin).astype(int)
+        print("Using default N, N = " + str(N) + " If d>2 or X is not pi then results might not be accurate.")
+    # Code only works for N>2
+    if N <= 2:
+        print("Code requires N>2. If you're using default N, then Lf is too small compared to dxMin")
+        return 
+    # First set up the mass matrix for the Galerkin basis from Shen (SISC95)
+    M = (np.pi/2)*(2*np.eye(N-1) - np.diag(np.ones(N-3),2) - np.diag(np.ones(N-3),-2))
+    M[0,0] = 3*np.pi/2
+    # The range of wavenumbers is 0<=|k|<=sqrt(2)*pi/dxMin. Nyquist here is for a 2D grid. 
+    # Per the notes, define s=k^2.
+    # Need to rescale to t in [-1,1]: t = (2/sMax)*s -1; s = sMax*(t+1)/2
+    sMax = d*(np.pi/dxMin)**2
+    # Set up target filter
+    if shape == "Gaussian":
+        F = lambda t: np.exp(-(sMax*(t+1)/2)*Lf**2/24)
+    elif shape == "Taper":
+        # F = interpolate.PchipInterpolator(np.array([-1,(2/sMax)*(2*np.pi/(X*Lf))**2 -1,(2/sMax)*(2*np.pi/Lf)**2 -1,2]),np.array([1,1,0,0]))
+        transition_width = X
+        filter_scale = Lf
+        FK = interpolate.PchipInterpolator(np.array([0, 2 * np.pi / (transition_width * filter_scale), 2 * np.pi / filter_scale, 2 * np.sqrt(sMax)]), np.array([1, 1, 0, 0]))
+        F = lambda t: FK(np.sqrt((t + 1) * (sMax / 2)))
+    else:
+        print("Please input a valid shape: Gaussian or Taper")
+        return
+    # Compute inner products of Galerkin basis with target
+    b = np.zeros(N-1)
+    points, weights = np.polynomial.chebyshev.chebgauss(N+1)
+    for i in range(N-1):
+        tmp = np.zeros(N+1)
+        tmp[i] = 1
+        tmp[i+2] = -1
+        phi = np.polynomial.chebyshev.chebval(points,tmp)
+        b[i] = np.sum(weights*phi*(F(points)-((1-points)/2 + F(1)*(points+1)/2)))
+    # Get polynomial coefficients in Galerkin basis
+    cHat = np.linalg.solve(M,b)
+    # Convert back to Chebyshev basis coefficients
+    p = np.zeros(N+1)
+    p[0] = cHat[0] + (1+F(1))/2
+    p[1] = cHat[1] - (1-F(1))/2
+    for i in range(2,N-1):
+        p[i] = cHat[i] - cHat[i-2]
+    p[N-1] = -cHat[N-3]
+    p[N] = -cHat[N-2]
+    # Now plot the target filter and the approximate filter
+    #x = np.linspace(-1,1,251)
+    x = np.linspace(-1,1,10000)
+    k = np.sqrt((sMax/2)*(x+1))
+    #params = {'legend.fontsize': 'x-large',
+    #     'axes.labelsize': 'x-large',
+    #     'axes.titlesize':'x-large',
+    #     'xtick.labelsize':'x-large',
+    #     'ytick.labelsize':'x-large'}
+    #pylab.rcParams.update(params)
+    
+    if plot_filter:
+        # f, ax = plt.subplots(1,1,figsize=(7,5))
+        plt.plot(k,F(x),'g',label='target filter',linewidth=4)
+        if shape=="Gaussian":
+            plt.axvline(2*np.pi/(np.sqrt(12)*Lf),color='m',linewidth=2, label=' Gaussian std', linestyle='--')
+            plt.plot(k,np.polynomial.chebyshev.chebval(x,p),'m',label='Gaussian approximation',linewidth=3)
+        else:
+            plt.plot(k,np.polynomial.chebyshev.chebval(x,p),'b',label='Taper approximation',linewidth=3)
+            plt.axvline(2*np.pi/(X*Lf),color='b',linewidth=1)
+            plt.axvline(2*np.pi/Lf,color='b',linewidth=1, label='Taper cutoff',linestyle='--')
+        left, right = plt.xlim()
+        plt.xlim(left=0, right=3)
+        bottom,top = plt.ylim()
+        plt.ylim(bottom=-0.2, top=1.1)
+        plt.xlabel(r'k [$\sqrt{\frac{1}{2}\frac{\pi^2}{dx^2}(x+1)}$]', fontsize=15)
+        plt.title('Lf = ' + str(Lf), fontsize=15)
+        plt.grid(True)
+           
+    
+    # Get roots of the polynomial
+    r = np.polynomial.chebyshev.chebroots(p)
+    # convert back to s in [0,sMax]
+    s = (sMax/2)*(r+1)
+    # Separate out the real and complex roots
+    NL = np.size(s[np.where(np.abs(np.imag(r)) < 1E-12)]) 
+    sL = np.real(s[np.where(np.abs(np.imag(r)) < 1E-12)])
+    NB = (N - NL)//2
+    sB_re,indices = np.unique(np.real(s[np.where(np.abs(np.imag(r)) > 1E-12)]),return_index=True)
+    sB_im = np.imag(s[np.where(np.abs(np.imag(r)) > 1E-12)])[indices]
+    sB = sB_re + sB_im*1j
+    return p,NL,sL,NB,sB
+
+
+# -----------------------------------------------------------------------------------------
 def Laplacian1D(field,landMask,dx):
     """
     Computes a Cartesian Laplacian of field. Assumes dy=constant, dx varies in y direction
@@ -395,7 +627,7 @@ def Filter(N, filter_type, field, dx, coarsening_factor, *args, **kwargs):
     
     if filter_type == 'boxcar':
         sla_filt_out = []
-        for m in tqdm(range(len(field))):  # loop over each track
+        for m in range(len(field)):  # tqdm(range(len(field))):  # loop over each track
             this_sla = field[m]
             b_filt = (1/(coarsening_factor))*np.ones(coarsening_factor)
             sla_filt = np.nan * np.ones(np.shape(this_sla))
@@ -404,17 +636,22 @@ def Filter(N, filter_type, field, dx, coarsening_factor, *args, **kwargs):
             sla_filt_out.append(sla_filt)    
     else:
         plot_filter = kwargs.get('plot_filter', 0)
-        NL,sL,NB,sB = filterSpec(N, dx, coarsening_factor, plot_filter, filter_type, X=np.pi)
+        # NL,sL,NB,sB = filterSpec(N, dx, coarsening_factor, plot_filter, filter_type, X=np.pi)
+        p,NL,sL,NB,sB = filterSpec1(dx,coarsening_factor,d=1,shape=filter_type,X=np.pi,N=-1,plot_filter=plot_filter)
         sla_filt_out = []
         # each track
-        for c in tqdm(range(len(field))):
+        for c in range(len(field)):  # tqdm(range(len(field))):
             sla_filt = np.nan * np.ones(np.shape(field[c]))
-            land = np.where(np.isnan(field[c][1, :]))[0]
-            landMask = np.zeros(np.shape(field[c])[1])
-            landMask[land] = 1
             # each cycle
             for m in range(np.shape(field[c])[0]):
                 data = field[c][m, :].copy()
+                land = np.where(np.isnan(field[c][0, :]))[0]
+                landMask = np.zeros(np.shape(field[c])[1])
+                landMask[land] = 1
+                wetMask = 1 - landMask
+                data = np.nan_to_num(data) 
+                data = data * wetMask # Initalize the filtering process
+                
                 # tempL_out = np.nan * np.ones((NL, np.shape(field)[0], np.shape(field)[1]))
                 for i in range(NL):
                     tempL = Laplacian1D(data,landMask,dx)
@@ -424,7 +661,7 @@ def Filter(N, filter_type, field, dx, coarsening_factor, *args, **kwargs):
                     tempL = Laplacian1D(data, landMask, dx)
                     tempB = Laplacian1D(tempL, landMask, dx)
                     data = data + (2*np.real(sB[i])/(np.abs(sB[i])**2))*tempL + (1/(np.abs(sB[i])**2))*tempB
-                sla_filt[m, :] = data
+                sla_filt[m, np.where(wetMask > 0)[0]] = data[np.where(wetMask > 0)[0]]
             sla_filt_out.append(sla_filt)
             
     return(sla_filt_out)
@@ -519,9 +756,9 @@ def velocity(dist, sla, lon_record, lat_record, track_record, stencil_width):
             # -- gradients from a 5 point stencil
             elif stencil_width == 5:   
                 sla_grad[:, cdm] = (-this_sla[:, cdm+2] + 8*this_sla[:, cdm+1] - 8*this_sla[:, cdm-1] \
-                                    + this_sla[:, cdm-2]) / (12*(hor_grid_spacing*1000.0))
+                                    + this_sla[:, cdm-2]) / (12*(grid_space*1000.0))
             elif stencil_width == 3: 
-                sla_grad[:, cdm] = (this_sla[:, cdm+1] - this_sla[:, cdm-1]) / (2*(hor_grid_spacing*1000.0))  
+                sla_grad[:, cdm] = (this_sla[:, cdm+1] - this_sla[:, cdm-1]) / (2*(grid_space*1000.0))  
             else:
                 print('select either 3,5,7 for gradient stencil_width')
                 
