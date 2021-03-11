@@ -623,7 +623,7 @@ def Laplacian1D(field,landMask,dx):
 
 # -----------------------------------------------------------------------------------------
 # FILTER DATA with filterSpec and Laplacian1D
-def Filter(N, filter_type, field, dx, coarsening_factor, *args, **kwargs):
+def Filter(filter_type, field, dx, coarsening_factor, *args, **kwargs):
     
     if filter_type == 'boxcar':
         sla_filt_out = []
@@ -636,7 +636,6 @@ def Filter(N, filter_type, field, dx, coarsening_factor, *args, **kwargs):
             sla_filt_out.append(sla_filt)    
     else:
         plot_filter = kwargs.get('plot_filter', 0)
-        # NL,sL,NB,sB = filterSpec(N, dx, coarsening_factor, plot_filter, filter_type, X=np.pi)
         p,NL,sL,NB,sB = filterSpec1(dx,coarsening_factor,d=1,shape=filter_type,X=np.pi,N=-1,plot_filter=plot_filter)
         sla_filt_out = []
         # each track
