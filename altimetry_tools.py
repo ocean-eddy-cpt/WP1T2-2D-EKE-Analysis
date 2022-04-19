@@ -501,7 +501,7 @@ def filterSpec1(dxMin,Lf,d=2,shape="Gaussian",X=np.pi,N=-1,plot_filter=1):
                 N = np.ceil(4.5*Lf/dxMin).astype(int)
             else: # d==2
                 N = np.ceil(6.4*Lf/dxMin).astype(int)
-        print("Using default N, N = " + str(N) + " If d>2 or X is not pi then results might not be accurate.")
+        # print("Using default N, N = " + str(N) + " If d>2 or X is not pi then results might not be accurate.")
     # Code only works for N>2
     if N <= 2:
         print("Code requires N>2. If you're using default N, then Lf is too small compared to dxMin")
@@ -666,7 +666,62 @@ def Filter(filter_type, field, dx, coarsening_factor, *args, **kwargs):
     return(sla_filt_out)
 
 # -----------------------------------------------------------------------------------------
-# -- ALT FILTERING FUNCTION 1
+# filter velocity using a Gaussian filter to an effective model resolution (IN DEGREES)
+# this function is slow: consider skipping ... we use a simpler kernel (from scipy) as it is faster
+def filter_degrees(total_vel, lon_record, lat_record, dist, resolution, sigma):
+    
+    dx = 1
+    p,NL,sL,NB,sB = filterSpec1(dx,sigma/resolution,d=1,shape='Gaussian',X=np.pi,N=-1,plot_filter=0)
+    
+    vel_1deg = []
+    for m in tqdm(range(len(total_vel))):  # loop over each altimeter track 
+        this_track = total_vel[m]
+        this_lon = lon_record[m]; this_lat = lat_record[m]; this_dist = dist[m];      
+        this_lon_step = 1852 * 60 * np.cos(np.deg2rad(this_lat)) * (resolution)
+        track_filt = np.nan * np.ones(np.shape(this_track))
+        for i in range(11, np.shape(this_track)[1] - 11):  # loop across all space
+            if np.isnan(this_lon_step[i]):
+                continue
+            # create local grid (grid step is defined by resolution variable) 
+            this_local_grid = np.arange(-this_lon_step[i]*4, this_lon_step[i]*5, this_lon_step[i])   
+            # loop in time (across each cycle)
+            for k in range(np.shape(this_track)[0]):   
+                track_on_local_lon_grid = np.interp(this_local_grid, (this_dist[i-10:i+11]*1000) - this_dist[i]*1000, \
+                                                    this_track[k, i-10:i+11])
+                
+                # --- filter using Gaussian kernel (scipy function) ---
+                # - (filter length is a factor of resolution ... length = number of grid steps * desired scale) 
+                # track_filt0 = si.gaussian_filter(track_on_local_lon_grid, sigma/resolution, order=0)     
+                
+                # --- filter using Gaussian kernel (diffusion base) --- 
+                track_filt0 = np.nan*np.ones(len(track_on_local_lon_grid))
+                data = track_on_local_lon_grid.copy()
+                land = np.where(np.isnan(track_on_local_lon_grid))[0]
+                landMask = np.zeros(np.shape(track_on_local_lon_grid)[0])
+                landMask[land] = 1; wetMask = 1 - landMask; data = np.nan_to_num(data); 
+                data = data * wetMask # Initalize the filtering process
+                for ii in range(NL):
+                    tempL = Laplacian1D(data,landMask,dx)
+                    data = data + (1/sL[ii])*tempL # Update filtered field
+                for ii in range(NB):
+                    tempL = Laplacian1D(data, landMask, dx)
+                    tempB = Laplacian1D(tempL, landMask, dx)
+                    data = data + (2*np.real(sB[ii])/(np.abs(sB[ii])**2))*tempL + (1/(np.abs(sB[ii])**2))*tempB
+                track_filt0[np.where(wetMask > 0)[0]] = data[np.where(wetMask > 0)[0]]
+                
+                # -- extract middle index -- 
+                if np.mod(len(track_on_local_lon_grid)/2,1) > 0:
+                    track_filt[k,i] = np.interp(np.median(this_local_grid), this_local_grid, track_filt0)
+                else:
+                    mid_i = np.int(len(track_on_local_lon_grid)/2)
+                    track_filt[k, i] = track_filt0[mid_i]     
+        vel_1deg.append(track_filt)
+    return vel_1deg 
+
+
+
+# -----------------------------------------------------------------------------------------
+# -- ALT/OLD FILTERING FUNCTION 1
 # define function to filter using a filter of variable length 
 # (filter scale = local distance equal to a desired grid step in longitude i.e. 1/4 degree)
 # filter USED is GAUSSIAN 
